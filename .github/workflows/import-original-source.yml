@@ -1,0 +1,124 @@
+name: Import original source bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: "HTTPS download URL for cherry3_source_faithful_v2.zip"
+        required: true
+        type: string
+      expected_sha256:
+        description: "Expected SHA-256 (64 lowercase/uppercase hex characters)"
+        required: true
+        type: string
+      target_branch:
+        description: "Existing branch in SpineAnimator/spine-animator-private"
+        required: true
+        default: "feat/sa-core-vision-animation-planner"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: import-original-source-bundle
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate inputs
+        env:
+          SOURCE_URL: ${{ inputs.source_url }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+        run: |
+          python - <<'PY'
+          import os, re, urllib.parse
+          u = urllib.parse.urlparse(os.environ["SOURCE_URL"])
+          if u.scheme != "https" or not u.hostname:
+              raise SystemExit("SOURCE_URL must be an absolute HTTPS URL")
+          if not re.fullmatch(r"[0-9a-fA-F]{64}", os.environ["EXPECTED_SHA256"]):
+              raise SystemExit("EXPECTED_SHA256 must contain exactly 64 hex characters")
+          PY
+
+      - name: Download and verify original bundle
+        env:
+          SOURCE_URL: ${{ inputs.source_url }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+        run: |
+          python - <<'PY'
+          import hashlib, os, urllib.request, zipfile
+          url = os.environ["SOURCE_URL"]
+          req = urllib.request.Request(url, headers={"User-Agent": "SA-PSD-Runner/1.0"})
+          with urllib.request.urlopen(req, timeout=90) as response, open("cherry3_source_faithful_v2.zip", "wb") as out:
+              if response.status != 200:
+                  raise SystemExit(f"Download failed: HTTP {response.status}")
+              total = 0
+              while True:
+                  chunk = response.read(1024 * 1024)
+                  if not chunk: break
+                  total += len(chunk)
+                  if total > 25 * 1024 * 1024:
+                      raise SystemExit("Bundle exceeds 25 MiB safety limit")
+                  out.write(chunk)
+          digest = hashlib.sha256(open("cherry3_source_faithful_v2.zip","rb").read()).hexdigest()
+          expected = os.environ["EXPECTED_SHA256"].lower()
+          if digest != expected:
+              raise SystemExit(f"SHA-256 mismatch: got {digest}")
+          with zipfile.ZipFile("cherry3_source_faithful_v2.zip") as z:
+              bad = z.testzip()
+              if bad:
+                  raise SystemExit(f"ZIP integrity failure at {bad}")
+              names = set(z.namelist())
+              if not any(n.endswith("manifest.json") for n in names):
+                  raise SystemExit("Expected source bundle manifest is missing")
+          print(f"Verified bytes={total} sha256={digest}")
+          PY
+
+      - name: Upload to private SpineAnimator repository
+        env:
+          GH_TOKEN: ${{ secrets.SA_TARGET_REPO_TOKEN }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+        run: |
+          python - <<'PY'
+          import base64, hashlib, json, os, urllib.error, urllib.request
+          token = os.environ.get("GH_TOKEN", "")
+          if not token:
+              raise SystemExit("Missing Actions secret SA_TARGET_REPO_TOKEN")
+          path = "cherry3_source_faithful_v2.zip"
+          data = open(path, "rb").read()
+          digest = hashlib.sha256(data).hexdigest()
+          if digest != os.environ["EXPECTED_SHA256"].lower():
+              raise SystemExit("Payload changed after verification")
+          branch = os.environ["TARGET_BRANCH"]
+          if not branch or branch.startswith("/") or ".." in branch.split("/"):
+              raise SystemExit("Invalid target branch")
+          api = "https://api.github.com/repos/SpineAnimator/spine-animator-private/contents/source-bundles/cherry3_source_faithful_v2.zip"
+          headers = {
+              "Authorization": "Bearer " + token,
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "SA-PSD-Runner/1.0",
+          }
+          # Refuse overwrite: this is an immutable source receipt.
+          check = urllib.request.Request(api + "?ref=" + urllib.parse.quote(branch, safe=""), headers=headers)
+          try:
+              urllib.request.urlopen(check, timeout=30)
+              raise SystemExit("Target path already exists; refusing to overwrite")
+          except urllib.error.HTTPError as e:
+              if e.code != 404: raise
+          body = {
+              "message": "chore: add verified original Cherry PSD source bundle",
+              "branch": branch,
+              "content": base64.b64encode(data).decode("ascii"),
+          }
+          req = urllib.request.Request(api, data=json.dumps(body).encode(), headers={**headers, "Content-Type":"application/json"}, method="PUT")
+          with urllib.request.urlopen(req, timeout=90) as response:
+              result = json.load(response)
+          print("Uploaded commit:", result["commit"]["sha"])
+          print("Uploaded blob:", result["content"]["sha"])
+          print("Verified SHA-256:", digest)
+          PY

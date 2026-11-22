@@ -84,7 +84,7 @@ jobs:
           EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
         run: |
           python - <<'PY'
-          import base64, hashlib, json, os, urllib.error, urllib.request
+          import base64, hashlib, json, os, urllib.error, urllib.request, urllib.parse
           token = os.environ.get("GH_TOKEN", "")
           if not token:
               raise SystemExit("Missing Actions secret SA_TARGET_REPO_TOKEN")
